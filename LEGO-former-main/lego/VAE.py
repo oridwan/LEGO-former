@@ -21,13 +21,9 @@ from .base import BaseSynthesizer, random_state
 #torch.manual_seed(42)
 
 class Encoder(Module):
-    """Encoder for the VAE.
-
-    Args:
-        data_dim (int): Dimensions of the data.
-        compress_dims (tuple or list of ints): Size of each hidden layer.
-        embedding_dim (int): Size of the output vector.
-        transformer (DataTransformer): Data transformer containing column information.
+    """
+    Encoder with Class Token approach for VAE.
+    Uses two special tokens [MU_TOKEN] and [VAR_TOKEN] to generate global representations.
     """
 
     def __init__(self, data_dim, compress_dims, embedding_dim, transformer):
@@ -35,59 +31,50 @@ class Encoder(Module):
         self.transformer = transformer
         self.embedding_dim = embedding_dim
         
-        # 分离存储：模块列表 + 类型信息列表
+        # Column MLPs (保持原有的列处理逻辑)
         self.column_mlps = torch.nn.ModuleList()  
-        self.column_types = []  # 单独存储类型信息
+        self.column_types = [] 
         
-        # Calculate total number of tokens
-        self.total_tokens = 0
+        # Calculate total number of data tokens (不包括class tokens)
+        self.data_tokens = 0
         self.token_info = []
         
         for column_info in transformer._column_transform_info_list:
             if column_info.column_type == 'continuous':
-                # Continuous columns are split into two tokens
+                # Continuous columns split into two tokens
                 total_dim = column_info.output_dimensions
-                continuous_dim = 1  # Normalized continuous value
-                discrete_dim = total_dim - 1  # One-hot encoded cluster part
+                continuous_dim = 1
+                discrete_dim = total_dim - 1
                 
-                # MLP for continuous values (first token)
+                # MLP for continuous values
                 continuous_mlp = Sequential(
                     Linear(continuous_dim, embedding_dim // 2),
                     ReLU(),
                     Linear(embedding_dim // 2, embedding_dim)
                 )
                 
-                # MLP for discrete values (second token)
+                # MLP for discrete values  
                 discrete_mlp = Sequential(
                     Linear(discrete_dim, embedding_dim // 2),
                     ReLU(), 
                     Linear(embedding_dim // 2, embedding_dim)
                 )
                 
-                # 只存储模块，类型信息单独存储
                 self.column_mlps.append(continuous_mlp)
                 self.column_mlps.append(discrete_mlp)
                 
-                # 存储类型信息
                 self.column_types.append('continuous_value')
                 self.column_types.append('continuous_cluster')
                 
-                # Store token information
-                self.token_info.append({
-                    'type': 'continuous_value',
-                    'start_dim': 0,
-                    'dim': continuous_dim
-                })
-                self.token_info.append({
-                    'type': 'continuous_cluster', 
-                    'start_dim': continuous_dim,
-                    'dim': discrete_dim
-                })
+                self.token_info.extend([
+                    {'type': 'continuous_value', 'dim': continuous_dim},
+                    {'type': 'continuous_cluster', 'dim': discrete_dim}
+                ])
                 
-                self.total_tokens += 2
+                self.data_tokens += 2
                 
             else:
-                # Purely discrete values (single token)
+                # Discrete columns (single token)
                 column_dim = column_info.output_dimensions
                 mlp = Sequential(
                     Linear(column_dim, embedding_dim // 2),
@@ -95,66 +82,77 @@ class Encoder(Module):
                     Linear(embedding_dim // 2, embedding_dim)
                 )
                 
-                # 只存储模块
                 self.column_mlps.append(mlp)
                 self.column_types.append('discrete')
                 
                 self.token_info.append({
-                    'type': 'discrete',
-                    'start_dim': 0,
+                    'type': 'discrete', 
                     'dim': column_dim
                 })
                 
-                self.total_tokens += 1   
-        # Positional encodings
+                self.data_tokens += 1
+        
+        # 🔥 关键改动：添加两个特殊的 class tokens
+        # 第一个token用于生成μ，第二个token用于生成σ
+        self.mu_class_token = Parameter(torch.randn(1, 1, embedding_dim))
+        self.var_class_token = Parameter(torch.randn(1, 1, embedding_dim))
+        
+        # 总token数 = 数据tokens + 2个class tokens  
+        self.total_tokens = self.data_tokens + 2
+        
+        # Position encodings for all tokens (including class tokens)
         self.positional_encodings = Parameter(torch.randn(self.total_tokens, embedding_dim))
         
-        # Self-attention layers (4 layers)
+        # Self-attention layers
         self.attention_layers = torch.nn.ModuleList()
         for _ in range(4):
             attention_layer = torch.nn.ModuleDict({
-                'attention': torch.nn.MultiheadAttention(
-                    embed_dim=embedding_dim,
-                    num_heads=8,
-                    dropout=0.1,
-                    batch_first=True
-                ),
-                'norm1': torch.nn.LayerNorm(embedding_dim),
-                'mlp': Sequential(
-                    Linear(embedding_dim, embedding_dim * 4),
-                    ReLU(),
-                    torch.nn.Dropout(0.1),
-                    Linear(embedding_dim * 4, embedding_dim),
-                    torch.nn.Dropout(0.1)
-                ),
-                'norm2': torch.nn.LayerNorm(embedding_dim)
+            'attention': torch.nn.MultiheadAttention(
+                embed_dim=embedding_dim,
+                num_heads=8,
+                dropout=0.1,
+                batch_first=True
+            ),
+            'norm1': torch.nn.LayerNorm(embedding_dim),  # 改为LayerNorm
+            'mlp': Sequential(
+                Linear(embedding_dim, embedding_dim * 4),
+                ReLU(),
+                torch.nn.Dropout(0.1),
+                Linear(embedding_dim * 4, embedding_dim),
+                torch.nn.Dropout(0.1)
+            ),
+            'norm2': torch.nn.LayerNorm(embedding_dim)  # 改为LayerNorm
             })
             self.attention_layers.append(attention_layer)
         
-        # MLP for each token to generate mu and logvar
-        self.token_mu_mlps = torch.nn.ModuleList()
-        self.token_logvar_mlps = torch.nn.ModuleList()
+        # 🔥 关键改动：只需要两个MLP用于class tokens
+        # 从第一个class token生成μ
+        self.mu_head = Sequential(
+            Linear(embedding_dim, embedding_dim // 2),
+            ReLU(),
+            Linear(embedding_dim // 2, embedding_dim)
+        )
         
-        for _ in range(self.total_tokens):
-            # MLP for mu
-            mu_mlp = Sequential(
-                Linear(embedding_dim, embedding_dim // 2),
-                ReLU(),
-                Linear(embedding_dim // 2, embedding_dim)
-            )
-            self.token_mu_mlps.append(mu_mlp)
-            
-            # MLP for logvar
-            logvar_mlp = Sequential(
-                Linear(embedding_dim, embedding_dim // 2),
-                ReLU(),
-                Linear(embedding_dim // 2, embedding_dim)
-            )
-            self.token_logvar_mlps.append(logvar_mlp)
+        # 从第二个class token生成logvar
+        self.logvar_head = Sequential(
+            Linear(embedding_dim, embedding_dim // 2),
+            ReLU(),
+            Linear(embedding_dim // 2, embedding_dim)
+        )
 
     def forward(self, input_):
-        """Encode the passed `input_`."""
-        tokens = []
+        """
+        Encode with class token approach.
+        
+        Returns:
+            mu: [batch_size, embedding_dim] - single global μ
+            std: [batch_size, embedding_dim] - single global σ  
+            logvar: [batch_size, embedding_dim] - single global log(σ²)
+        """
+        batch_size = input_.shape[0]
+        
+        # 1. Process data tokens (和之前一样)
+        data_tokens = []
         st = 0
         token_idx = 0
         
@@ -163,60 +161,77 @@ class Encoder(Module):
             column_data = input_[:, st : st + dim]
             
             if column_transform_info.column_type == 'continuous':
-                # Split continuous column into two tokens
-                continuous_part = column_data[:, :1]  # Normalized value
-                discrete_part = column_data[:, 1:]    # One-hot cluster ID
+                # Split continuous column  
+                continuous_part = column_data[:, :1]
+                discrete_part = column_data[:, 1:]
                 
-                # Process continuous value token
+                # Process both parts
                 continuous_token = self.column_mlps[token_idx](continuous_part)
-                continuous_token = continuous_token + self.positional_encodings[token_idx]
-                tokens.append(continuous_token)
-                token_idx += 1
+                discrete_token = self.column_mlps[token_idx + 1](discrete_part)
                 
-                # Process cluster ID token
-                discrete_token = self.column_mlps[token_idx](discrete_part)
-                discrete_token = discrete_token + self.positional_encodings[token_idx]
-                tokens.append(discrete_token)
-                token_idx += 1
+                data_tokens.extend([continuous_token, discrete_token])
+                token_idx += 2
                 
             else:
-                # Process discrete column as single token
+                # Process discrete column
                 token = self.column_mlps[token_idx](column_data)
-                token = token + self.positional_encodings[token_idx]
-                tokens.append(token)
+                data_tokens.append(token)
                 token_idx += 1
             
             st += dim
         
+        # 2. Prepare class tokens
+        # Shape: [batch_size, 1, embedding_dim]  add to the beginning of the sequence
+        mu_token = self.mu_class_token.expand(batch_size, -1, -1)
+        var_token = self.var_class_token.expand(batch_size, -1, -1)
+
         
-        # Stack tokens to get [batch_size, total_tokens, embedding_dim]
-        x = torch.stack(tokens, dim=1)
+        # data_tokens [batch_size, embedding_dim]
+        #  [batch_size, 1, embedding_dim]，然后 cat
+        data_tokens_tensors = [token.unsqueeze(1) for token in data_tokens]  #[batch_size, 1, embedding_dim]
+        data_tokens_tensor = torch.cat(data_tokens_tensors, dim=1)  # [batch_size, num_data_tokens, embedding_dim]
+    
+        # 3. Concatenate: [mu_token, var_token, data_token1, data_token2, ...]
+        all_tokens = [mu_token, var_token, data_tokens_tensor]
         
-        # Apply self-attention layers
+        # Stack to get [batch_size, total_tokens, embedding_dim]
+        x = torch.cat(all_tokens, dim=1)
+        
+        # 4. Add positional encodings
+        x = x + self.positional_encodings.unsqueeze(0)  # broadcast over batch
+        
+        # 5. Apply self-attention layers
         for layer in self.attention_layers:
             # Self-attention with residual connection
             attn_out, _ = layer['attention'](x, x, x)
-            x = layer['norm1'](x + attn_out)
             
-            # MLP with residual connection
+            # 🔥 修复：BatchNorm1d 需要 [batch_size, features] 形状
+            # 需要重新reshape为 [batch_size * seq_len, embedding_dim]
+            batch_size, seq_len, embed_dim = x.shape
+            x_reshaped = (x + attn_out).view(-1, embed_dim)  # [batch_size * seq_len, embedding_dim]
+            x_normed = layer['norm1'](x_reshaped)
+            x = x_normed.view(batch_size, seq_len, embed_dim)  # 恢复形状
+            
+            # MLP with residual connection  
             mlp_out = layer['mlp'](x)
-            x = layer['norm2'](x + mlp_out)
+            
+            # 再次处理 BatchNorm1d
+            x_reshaped = (x + mlp_out).view(-1, embed_dim)
+            x_normed = layer['norm2'](x_reshaped)
+            x = x_normed.view(batch_size, seq_len, embed_dim)
+
+        # 6. Extract class token outputs
+        # The first token (index 0) to generate μ
+        # The second token (index 1) to generate logvar
+        mu_token_output = x[:, 0, :]  # [batch_size, embedding_dim]
+        var_token_output = x[:, 1, :]  # [batch_size, embedding_dim]
         
-        # Generate mu and logvar for each token
-        token_mus = []
-        token_logvars = []
+        # 7. Generate final μ and logvar
+        mu = self.mu_head(mu_token_output)  # [batch_size, embedding_dim]
+        logvar = self.logvar_head(var_token_output)  # [batch_size, embedding_dim]
         
-        for i in range(x.shape[1]):  # for each token
-            token_feature = x[:, i, :]  # [batch_size, embedding_dim]
-            mu = self.token_mu_mlps[i](token_feature)  # [batch_size, embedding_dim]
-            logvar = self.token_logvar_mlps[i](token_feature)  # [batch_size, embedding_dim]
-            token_mus.append(mu)
-            token_logvars.append(logvar)
-        
-        # Stack to get [batch_size, total_tokens, embedding_dim]
-        mu = torch.stack(token_mus, dim=1)
-        logvar = torch.stack(token_logvars, dim=1)
-        std = torch.exp(0.5 * logvar)
+        # 8. Compute std
+        std = torch.exp(0.5 * logvar)  # [batch_size, embedding_dim]
         
         return mu, std, logvar
 
@@ -333,12 +348,20 @@ class Decoder(Module):
 
     def forward(self, input_):
         """Decode the passed `input_` through self-attention layers."""
-        # input_ shape: [batch_size, num_columns, embedding_dim]
-        # positional_encodings shape: [num_columns, embedding_dim]
-        input_ = input_ + self.positional_encodings.unsqueeze(0)  # Broadcast over batch dimension
+        # input_ shape: [batch_size, embedding_dim] - single latent vector
+        batch_size = input_.shape[0]
+        
+        # Expand single latent vector to all data token positions
+        # Skip class token positions (first 2 tokens) and only use data token positions
+        data_positions = self.positional_encodings[2:, :]  # [data_tokens, embedding_dim]
+        
+        # Expand latent vector to match number of data tokens
+        x = input_.unsqueeze(1).expand(-1, self.total_tokens, -1)  # [batch_size, data_tokens, embedding_dim]
+
+        # Add positional encodings for data tokens only broadcast over batch dimension
+        x = x + data_positions.unsqueeze(0)  # [batch_size, data_tokens, embedding_dim]
         
         # Apply self-attention layers
-        x = input_
         for layer in self.attention_layers:
             # Self-attention with residual connection
             attn_out, _ = layer['attention'](x, x, x)
@@ -349,7 +372,6 @@ class Decoder(Module):
             x = layer['norm2'](x + mlp_out)
         
         # Decode each token back to its original dimensions
-        
         reconstructed_columns = []
         token_idx = 0
         
@@ -378,7 +400,7 @@ class Decoder(Module):
                 token_idx += 1
         
         # Concatenate all column outputs to get final data
-        output = torch.cat(reconstructed_columns, dim=1)  # [batch_size, data_dim] still become data_dim
+        output = torch.cat(reconstructed_columns, dim=1)  # [batch_size, data_dim]
             
         return output, self.sigma
 
@@ -408,10 +430,14 @@ def _loss_function(recon_x, x, sigmas, mu, logvar, output_info, factor):
     
     # mu, logvar shape: [batch_size, num_columns, embedding_dim]
     # Need to sum over all dimensions except batch dimension, then average over batch
-    KLD = -0.5 * torch.sum(1 + logvar - mu**2 - logvar.exp(), dim=(1, 2))  # Sum over columns and embedding dims
-    KLD = torch.mean(KLD)  # Average over batch dimension
+    #KLD = -0.5 * torch.sum(1 + logvar - mu**2 - logvar.exp(), dim=(1, 2))  # Sum over columns and embedding dims
+    #KLD = torch.mean(KLD)  # Average over batch dimension
 
+    
+    KLD = -0.5 * torch.sum(1 + logvar - mu**2 - logvar.exp())
     return sum(loss) * factor / x.size()[0], KLD / x.size()[0]
+
+    
 
 
 class VAE(BaseSynthesizer):
@@ -614,7 +640,7 @@ class VAE(BaseSynthesizer):
                 
                 # 添加β调度
                 beta = self.get_beta(i)
-                loss = loss_1 + beta * loss_2  # 修改这里
+                loss = loss_1 + beta * loss_2  # total loss
                 
                 loss.backward()
                 optimizerAE.step()
@@ -684,23 +710,17 @@ class VAE(BaseSynthesizer):
     @random_state
     def sample(self, samples):
         """
-        Sample data similar to the training data.
-        
-        Args:
-            samples (int): Number of rows to sample.
-
-        Returns:
-            numpy.ndarray or pandas.DataFrame
+        Sample with single latent vector approach.
         """
         self.decoder.eval()
         steps = samples // self.batch_size + 1
         data = []
+        
         for _ in range(steps):
-            # Sample from latent space for each token
-            # Shape: [batch_size, total_tokens, embedding_dim]
-            mean = torch.zeros(self.batch_size, self.encoder.total_tokens, self.embedding_dim)
-            std = mean + 1
-            noise = torch.normal(mean=mean, std=std).to(self._device)
+          
+            # Shape: [batch_size, embedding_dim] 而不是 [batch_size, total_tokens, embedding_dim]
+            noise = torch.randn(self.batch_size, self.embedding_dim).to(self._device)
+            
             fake, sigmas = self.decoder(noise)
             fake = torch.tanh(fake)
             data.append(fake.detach().cpu().numpy())
