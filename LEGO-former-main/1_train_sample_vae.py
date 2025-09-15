@@ -158,7 +158,7 @@ if __name__ == "__main__":
         verbose=True,
         cuda=cuda,
         batch_size=args.nbatch,
-        folder="models/Transformer_300epochs_classposition",
+        folder="models/Transformer_300epochs_classposition_BatchNorm1d",
         wandb_enabled=not args.no_wandb,  # Pass wandb flag to VAE
     )
 

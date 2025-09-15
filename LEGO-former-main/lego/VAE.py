@@ -94,34 +94,32 @@ class Encoder(Module):
         
         # 🔥 关键改动：添加两个特殊的 class tokens
         # 第一个token用于生成μ，第二个token用于生成σ
-        self.mu_class_token = Parameter(torch.randn(1, 1, embedding_dim))
-        self.var_class_token = Parameter(torch.randn(1, 1, embedding_dim))
-        
         # 总token数 = 数据tokens + 2个class tokens  
         self.total_tokens = self.data_tokens + 2
         
         # Position encodings for all tokens (including class tokens)
+        # The first two positions will serve as class tokens through positional encodings only
         self.positional_encodings = Parameter(torch.randn(self.total_tokens, embedding_dim))
         
-        # Self-attention layers
+        # 🔥 修改：Self-attention layers with BatchNorm1d
         self.attention_layers = torch.nn.ModuleList()
         for _ in range(4):
             attention_layer = torch.nn.ModuleDict({
-            'attention': torch.nn.MultiheadAttention(
-                embed_dim=embedding_dim,
-                num_heads=8,
-                dropout=0.1,
-                batch_first=True
-            ),
-            'norm1': torch.nn.LayerNorm(embedding_dim),  # 改为LayerNorm
-            'mlp': Sequential(
-                Linear(embedding_dim, embedding_dim * 4),
-                ReLU(),
-                torch.nn.Dropout(0.1),
-                Linear(embedding_dim * 4, embedding_dim),
-                torch.nn.Dropout(0.1)
-            ),
-            'norm2': torch.nn.LayerNorm(embedding_dim)  # 改为LayerNorm
+                'attention': torch.nn.MultiheadAttention(
+                    embed_dim=embedding_dim,
+                    num_heads=8,
+                    dropout=0.1,
+                    batch_first=True
+                ),
+                'norm1': torch.nn.BatchNorm1d(embedding_dim),  # 🔥 改为BatchNorm1d
+                'mlp': Sequential(
+                    Linear(embedding_dim, embedding_dim * 4),
+                    ReLU(),
+                    torch.nn.Dropout(0.1),
+                    Linear(embedding_dim * 4, embedding_dim),
+                    torch.nn.Dropout(0.1)
+                ),
+                'norm2': torch.nn.BatchNorm1d(embedding_dim)   # 🔥 改为BatchNorm1d
             })
             self.attention_layers.append(attention_layer)
         
@@ -180,57 +178,65 @@ class Encoder(Module):
             
             st += dim
         
-        # 2. Prepare class tokens
-        # Shape: [batch_size, 1, embedding_dim]  add to the beginning of the sequence
-        mu_token = self.mu_class_token.expand(batch_size, -1, -1)
-        var_token = self.var_class_token.expand(batch_size, -1, -1)
-
+        # 2. Create class tokens using positional encodings only
+        # Use the first two positional encodings as class tokens
+        mu_token = self.positional_encodings[0:1, :].expand(batch_size, -1, -1)  # [batch_size, 1, embedding_dim]
+        var_token = self.positional_encodings[1:2, :].expand(batch_size, -1, -1)  # [batch_size, 1, embedding_dim]
         
-        # data_tokens [batch_size, embedding_dim]
-        #  [batch_size, 1, embedding_dim]，然后 cat
+        # 3. Prepare data tokens
+        # data_tokens [batch_size, embedding_dim] -> [batch_size, 1, embedding_dim]，然后 cat
         data_tokens_tensors = [token.unsqueeze(1) for token in data_tokens]  #[batch_size, 1, embedding_dim]
         data_tokens_tensor = torch.cat(data_tokens_tensors, dim=1)  # [batch_size, num_data_tokens, embedding_dim]
     
-        # 3. Concatenate: [mu_token, var_token, data_token1, data_token2, ...]
+        # 4. Concatenate: [mu_token, var_token, data_token1, data_token2, ...]
         all_tokens = [mu_token, var_token, data_tokens_tensor]
         
         # Stack to get [batch_size, total_tokens, embedding_dim]
         x = torch.cat(all_tokens, dim=1)
         
-        # 4. Add positional encodings
-        x = x + self.positional_encodings.unsqueeze(0)  # broadcast over batch
+        # 5. Add positional encodings only to data tokens
+        # mu_token and var_token already have positional encodings
+        # Only add positional encodings to data tokens (starting from index 2)
+        data_pos_encodings = self.positional_encodings[2:, :]  # Skip first 2 class token positions
+        x[:, 2:, :] = x[:, 2:, :] + data_pos_encodings.unsqueeze(0)  # Only add to data tokens
         
-        # 5. Apply self-attention layers
+        # 6. 🔥 修改：Apply self-attention layers with BatchNorm1d
         for layer in self.attention_layers:
             # Self-attention with residual connection
             attn_out, _ = layer['attention'](x, x, x)
             
-            # 🔥 修复：BatchNorm1d 需要 [batch_size, features] 形状
-            # 需要重新reshape为 [batch_size * seq_len, embedding_dim]
-            batch_size, seq_len, embed_dim = x.shape
-            x_reshaped = (x + attn_out).view(-1, embed_dim)  # [batch_size * seq_len, embedding_dim]
-            x_normed = layer['norm1'](x_reshaped)
-            x = x_normed.view(batch_size, seq_len, embed_dim)  # 恢复形状
+            # 🔥 BatchNorm1d 需要 [batch_size, features] 形状
+            # 重塑张量从 [batch_size, seq_len, embedding_dim] -> [batch_size * seq_len, embedding_dim]
+            batch_size_curr, seq_len, embed_dim = x.shape
+            residual_1 = x + attn_out  # [batch_size, seq_len, embedding_dim]
+            residual_1_reshaped = residual_1.view(-1, embed_dim)  # [batch_size * seq_len, embedding_dim]
+            
+            # 应用 BatchNorm1d
+            x_normed = layer['norm1'](residual_1_reshaped)  # [batch_size * seq_len, embedding_dim]
+            x = x_normed.view(batch_size_curr, seq_len, embed_dim)  # 恢复形状 [batch_size, seq_len, embedding_dim]
             
             # MLP with residual connection  
             mlp_out = layer['mlp'](x)
             
             # 再次处理 BatchNorm1d
-            x_reshaped = (x + mlp_out).view(-1, embed_dim)
-            x_normed = layer['norm2'](x_reshaped)
-            x = x_normed.view(batch_size, seq_len, embed_dim)
+            residual_2 = x + mlp_out  # [batch_size, seq_len, embedding_dim]
+            residual_2_reshaped = residual_2.view(-1, embed_dim)  # [batch_size * seq_len, embedding_dim]
+            
+            # 应用 BatchNorm1d
+            x_normed_2 = layer['norm2'](residual_2_reshaped)  # [batch_size * seq_len, embedding_dim]
+            x = x_normed_2.view(batch_size_curr, seq_len, embed_dim)  # 恢复形状 [batch_size, seq_len, embedding_dim]
 
-        # 6. Extract class token outputs
+        # 7. Extract class token outputs
         # The first token (index 0) to generate μ
         # The second token (index 1) to generate logvar
         mu_token_output = x[:, 0, :]  # [batch_size, embedding_dim]
         var_token_output = x[:, 1, :]  # [batch_size, embedding_dim]
         
-        # 7. Generate final μ and logvar
+        # 8. Generate final μ and logvar
         mu = self.mu_head(mu_token_output)  # [batch_size, embedding_dim]
         logvar = self.logvar_head(var_token_output)  # [batch_size, embedding_dim]
         
-        # 8. Compute std
+        # 9. Compute std
         std = torch.exp(0.5 * logvar)  # [batch_size, embedding_dim]
         
         return mu, std, logvar
@@ -253,7 +259,7 @@ class Decoder(Module):
         self.positional_encodings = positional_encodings
         self.embedding_dim = embedding_dim
         
-        # Self-attention layers (4 layers, same as encoder)
+        # Self-attention layers with BatchNorm1d (4 layers, same as encoder)
         self.attention_layers = torch.nn.ModuleList()
         for _ in range(4):
             attention_layer = torch.nn.ModuleDict({
@@ -263,7 +269,7 @@ class Decoder(Module):
                     dropout=0.1,
                     batch_first=True
                 ),
-                'norm1': torch.nn.LayerNorm(embedding_dim),
+                'norm1': torch.nn.BatchNorm1d(embedding_dim),  # BatchNorm1d
                 'mlp': Sequential(
                     Linear(embedding_dim, embedding_dim * 4),
                     ReLU(),
@@ -271,7 +277,7 @@ class Decoder(Module):
                     Linear(embedding_dim * 4, embedding_dim),
                     torch.nn.Dropout(0.1)
                 ),
-                'norm2': torch.nn.LayerNorm(embedding_dim)
+                'norm2': torch.nn.BatchNorm1d(embedding_dim)   # BatchNorm1d
             })
             self.attention_layers.append(attention_layer)
         
@@ -361,15 +367,31 @@ class Decoder(Module):
         # Add positional encodings for data tokens only broadcast over batch dimension
         x = x + data_positions.unsqueeze(0)  # [batch_size, data_tokens, embedding_dim]
         
-        # Apply self-attention layers
+        # Apply self-attention layers with BatchNorm1d
         for layer in self.attention_layers:
             # Self-attention with residual connection
             attn_out, _ = layer['attention'](x, x, x)
-            x = layer['norm1'](x + attn_out)
+
+            # BatchNorm1d 需要 [batch_size, features] 形状
+            # 重塑张量从 [batch_size, seq_len, embedding_dim] -> [batch_size * seq_len, embedding_dim]
+            batch_size_curr, seq_len, embed_dim = x.shape
+            residual_1 = x + attn_out  # [batch_size, seq_len, embedding_dim]
+            residual_1_reshaped = residual_1.view(-1, embed_dim)  # [batch_size * seq_len, embedding_dim]
+            
+            # 应用 BatchNorm1d
+            x_normed = layer['norm1'](residual_1_reshaped)  # [batch_size * seq_len, embedding_dim]
+            x = x_normed.view(batch_size_curr, seq_len, embed_dim)  # 恢复形状 [batch_size, seq_len, embedding_dim]
             
             # MLP with residual connection
             mlp_out = layer['mlp'](x)
-            x = layer['norm2'](x + mlp_out)
+            
+            # 再次处理 BatchNorm1d
+            residual_2 = x + mlp_out  # [batch_size, seq_len, embedding_dim]
+            residual_2_reshaped = residual_2.view(-1, embed_dim)  # [batch_size * seq_len, embedding_dim]
+            
+            # 应用 BatchNorm1d
+            x_normed_2 = layer['norm2'](residual_2_reshaped)  # [batch_size * seq_len, embedding_dim]
+            x = x_normed_2.view(batch_size_curr, seq_len, embed_dim)  # 恢复形状 [batch_size, seq_len, embedding_dim]
         
         # Decode each token back to its original dimensions
         reconstructed_columns = []
